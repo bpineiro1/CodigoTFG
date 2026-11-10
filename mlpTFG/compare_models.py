@@ -4,8 +4,8 @@ Comparación estadística entre dos modelos evaluados con las mismas particiones
 Para cada dataset y métrica:
   - Media ± desviación típica entre repeticiones de cada modelo.
   - t-test pareado sobre las medias de las repeticiones (como en el TFG de referencia).
-  - t-test pareado corregido para validación cruzada repetida 
-    sobre los folds emparejados. Es más conservador, porque
+  - t-test pareado corregido para validación cruzada repetida (Nadeau y Bengio, 2003;
+    Bouckaert y Frank, 2004) sobre los folds emparejados. Es más conservador, porque
     tiene en cuenta que los folds comparten datos de entrenamiento.
 Ambos modelos usan exactamente las mismas particiones (mismas semillas), así que cada
 fold de un modelo se compara con el mismo fold del otro.
@@ -17,6 +17,8 @@ Uso (desde la raíz del proyecto):
     python compare_models.py --mc    # inferencia Monte Carlo (results/mc/):
                                      #   MLP frente a MLP + DDS (MC) y
                                      #   MLP + DDS determinista frente a MLP + DDS (MC)
+    python compare_models.py --mc --umbral f1   # lo mismo con el umbral elegido por F1
+                                                # (results/umbral_f1/)
 """
 import argparse
 import os
@@ -25,8 +27,10 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-RESULTS_DIR = "results"
+V1_DIR = "results"   # resultados de la versión 1 (umbral por G-Mean)
+RESULTS_DIR = V1_DIR
 MC_DIR = os.path.join(RESULTS_DIR, "mc")
+THRESHOLD_FREE = ["AUC-ROC", "AUC-PR", "NDCG@10", "Precision@10"]  # no dependen del umbral
 DATASETS = ["GO", "PathDip"]
 METRICS = ["AUC-ROC", "AUC-PR", "G-Mean", "F1-Score", "NDCG@10", "Precision@10", "Sensitivity", "Specificity"]
 ALPHA = 0.05
@@ -107,23 +111,42 @@ def compare(a, b, out_dir, out_name):
     print(df_p.to_string(index=False))
 
 
-def check_det_reproduces_v1():
-    """La inferencia determinista de results/mc debe dar lo mismo que la versión 1 (results/)."""
-    for ds in DATASETS:
-        p_v1 = os.path.join(RESULTS_DIR, f"metricas_detalladas_folds_MLP_DDS_{ds}.csv")
-        p_det = os.path.join(MC_DIR, f"metricas_detalladas_folds_MLP_DDS_DET_{ds}.csv")
-        if not (os.path.exists(p_v1) and os.path.exists(p_det)):
-            continue
-        v1 = pd.read_csv(p_v1).merge(pd.read_csv(p_det), on=["Semilla", "Fold"], suffixes=("_v1", "_det"))
-        diff = max(float(np.max(np.abs(v1[f"{m}_v1"] - v1[f"{m}_det"]))) for m in ["AUC-ROC", "AUC-PR", "G-Mean", "F1-Score"])
-        estado = "OK, reproduce la versión 1" if diff < 1e-6 else "AVISO: no coincide exactamente con la versión 1"
-        print(f"[Comprobación {ds}] {len(v1)} folds comunes, diferencia máxima con la v1 = {diff:.6f} -> {estado}")
+def check_reproduces_v1(criterion):
+    """
+    Los modelos entrenados son los mismos que en la versión 1, así que:
+      - con umbral por G-Mean, el DDS determinista debe dar exactamente las métricas de la v1;
+      - con otro umbral, deben coincidir las métricas que no dependen del umbral, tanto en el
+        MLP como en el DDS determinista.
+    """
+    checks = [("MLP + DDS (determinista)", f"metricas_detalladas_folds_MLP_DDS_{{}}.csv",
+               os.path.join(MC_DIR, "metricas_detalladas_folds_MLP_DDS_DET_{}.csv"))]
+    if criterion != "gmean":
+        checks.append(("MLP", "metricas_detalladas_folds_MLP_{}.csv",
+                       os.path.join(RESULTS_DIR, "metricas_detalladas_folds_MLP_{}.csv")))
+    metrics = ["AUC-ROC", "AUC-PR", "G-Mean", "F1-Score"] if criterion == "gmean" else THRESHOLD_FREE
+    for name, v1_pattern, new_pattern in checks:
+        for ds in DATASETS:
+            p_v1 = os.path.join(V1_DIR, v1_pattern.format(ds))
+            p_new = new_pattern.format(ds)
+            if not (os.path.exists(p_v1) and os.path.exists(p_new)):
+                continue
+            df = pd.read_csv(p_v1).merge(pd.read_csv(p_new), on=["Semilla", "Fold"], suffixes=("_v1", "_new"))
+            diff = max(float(np.max(np.abs(df[f"{m}_v1"] - df[f"{m}_new"]))) for m in metrics)
+            estado = "OK, mismos modelos que la versión 1" if diff < 1e-6 else "AVISO: no coincide con la versión 1"
+            print(f"[Comprobación {name}, {ds}] {len(df)} folds, diferencia máxima en {', '.join(metrics)} = {diff:.6f} -> {estado}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mc", action="store_true", help="comparar la inferencia Monte Carlo (results/mc)")
+    parser.add_argument("--umbral", choices=["gmean", "f1"], default="gmean",
+                        help="criterio del umbral con el que se generaron los resultados")
     args = parser.parse_args()
+
+    if args.umbral != "gmean":
+        RESULTS_DIR = os.path.join("results", f"umbral_{args.umbral}")
+        MC_DIR = os.path.join(RESULTS_DIR, "mc")
+    print(f"Umbral de decisión elegido por: {args.umbral} | resultados en '{RESULTS_DIR}/'")
 
     mlp = {"dir": RESULTS_DIR, "tag": "MLP", "name": "MLP (sin selección)"}
     if not args.mc:
@@ -132,7 +155,7 @@ if __name__ == "__main__":
     else:
         det = {"dir": MC_DIR, "tag": "MLP_DDS_DET", "name": "MLP + DDS (determinista)"}
         mc = {"dir": MC_DIR, "tag": "MLP_DDS_MC", "name": "MLP + DDS (Monte Carlo)"}
-        check_det_reproduces_v1()
+        check_reproduces_v1(args.umbral)
         print("\n" + "=" * 90)
         compare(mlp, mc, MC_DIR, "MLP_vs_DDS_MC")
         print("\n" + "=" * 90)

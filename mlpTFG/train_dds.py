@@ -9,7 +9,7 @@ el MLP baseline (train_mlp.py):
     como porcentaje de positivos).
 La configuración común se importa de train_mlp.py para que no pueda divergir.
 
-Inferencia Monte Carlo:
+Inferencia Monte Carlo (propuesta de los directores):
   En entrenamiento el DDS muestrea las compuertas con ruido (selecciones aleatorias), pero
   en la versión 1 la evaluación era determinista (sin ruido, Top-K fijo). Ahora cada modelo
   entrenado se evalúa de dos formas:
@@ -21,12 +21,17 @@ Inferencia Monte Carlo:
   resultados de la versión 1, lo que sirve de comprobación.
 
 Además del rendimiento, guarda cuántas características usa cada gen y con qué
-frecuencia se selecciona cada característica en genes CR y NotCR.
+frecuencia se selecciona cada característica en genes CR y NotCR, y las predicciones de
+validación interna del candidato elegido (para recalcular el umbral sin reentrenar).
+
+Umbral de decisión (--umbral): G-Mean (por defecto, resultados en results/mc/) o F1
+(resultados en results/umbral_f1/mc/). No cambia los modelos ni los hiperparámetros.
 
 Uso (desde la raíz del proyecto, junto a train_mlp.py):
     python train_dds.py                      # 10 repeticiones, GO y PathDip
     python train_dds.py --repeats 1 --datasets PathDip
-Resultados en results/mc/ (los de la versión 1 en results/ no se tocan).
+    python train_dds.py --umbral f1          # umbral elegido por F1
+Resultados en results/mc/ o results/umbral_f1/mc/ (los de la versión 1 en results/ no se tocan).
 """
 import argparse
 import os
@@ -46,7 +51,7 @@ from Code.plots import generate_evaluation_plots, generate_summary_table_image
 # Configuración común con el baseline
 from train_mlp import (
     SEEDS, N_ITER_SEARCH, N_OUTER_SPLITS, N_INNER_SPLITS, INNER_METRIC, THRESHOLD_CRITERION,
-    PARAM_SPACE, REPORT_METRICS, RESULTS_DIR, set_seed, fmt,
+    PARAM_SPACE, REPORT_METRICS, RESULTS_DIR, set_seed, fmt, results_dir_for,
 )
 
 if hasattr(os, "cpu_count") and os.cpu_count() is not None:
@@ -211,9 +216,11 @@ def nested_cv_dds(x, y, dataset, seed, device="cpu"):
     outer_cv = StratifiedKFold(n_splits=N_OUTER_SPLITS, shuffle=True, random_state=seed % (2**32))
     n_feat = x.shape[1]
     out = {
-        m: {"records": [], "oof": np.full(len(y), np.nan), "sel": {1: np.zeros(n_feat), 0: np.zeros(n_feat)}}
+        m: {"records": [], "oof": np.full(len(y), np.nan), "sel": {1: np.zeros(n_feat), 0: np.zeros(n_feat)},
+            "inner": []}
         for m in MODES
     }
+    oof_fold = np.zeros(len(y), dtype=int)
     act_counts = {1: np.zeros(n_feat), 0: np.zeros(n_feat)}
 
     for outer_fold, (train_idx, test_idx) in enumerate(outer_cv.split(x, y), 1):
@@ -273,6 +280,9 @@ def nested_cv_dds(x, y, dataset, seed, device="cpu"):
                 n_mc=n_mc_for(m), mc_seed=final_seed + MC_SEED_OFFSET,
             )
             out[m]["oof"][test_idx] = test_probs
+            oof_fold[test_idx] = outer_fold
+            out[m]["inner"].append(pd.DataFrame({"Fold": outer_fold, "idx": train_idx,
+                                                 "y": y_outer_train, "prob": best[m]["oof"]}))
 
             test_pred = predict_top_fraction(test_probs, positive_fraction)
             test_m = calculate_all_metrics(y_outer_test, test_probs, y_pred=test_pred)
@@ -315,7 +325,7 @@ def nested_cv_dds(x, y, dataset, seed, device="cpu"):
             "Sel_CR": out[m]["sel"][1], "Act_CR": act_counts[1],
             "Sel_NotCR": out[m]["sel"][0], "Act_NotCR": act_counts[0],
         })
-        results[m] = (out[m]["records"], out[m]["oof"], df_freq)
+        results[m] = (out[m]["records"], out[m]["oof"], df_freq, oof_fold, pd.concat(out[m]["inner"], ignore_index=True))
     return results
 
 
@@ -335,11 +345,12 @@ def run_or_load_repetition(x, y, dataset, seed, device):
     results = nested_cv_dds(x, y, dataset, seed, device=device)
     os.makedirs(DDS_REPS_DIR, exist_ok=True)
     loaded = {}
-    for m, (records, oof, df_freq) in results.items():
+    for m, (records, oof, df_freq, oof_fold, df_inner) in results.items():
         df_folds = pd.DataFrame(records)
         df_folds.to_csv(paths[m]["folds"], index=False)
-        pd.DataFrame({"prob": oof}).to_csv(paths[m]["oof"], index=False)
+        pd.DataFrame({"prob": oof, "fold": oof_fold}).to_csv(paths[m]["oof"], index=False)
         df_freq.to_csv(paths[m]["freq"], index=False)
+        df_inner.to_csv(paths[m]["folds"].replace("_folds.csv", "_inner.csv"), index=False)
         loaded[m] = (df_folds, oof, df_freq)
     return loaded
 
@@ -426,8 +437,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", nargs="+", default=["GO", "PathDip"])
     parser.add_argument("--repeats", type=int, default=len(SEEDS), help="nº de repeticiones (semillas) a usar")
+    parser.add_argument("--umbral", choices=["gmean", "f1"], default=THRESHOLD_CRITERION,
+                        help="métrica que maximiza el umbral de decisión en el bucle interno")
     args = parser.parse_args()
 
+    THRESHOLD_CRITERION = args.umbral
+    DDS_RESULTS_DIR = os.path.join(results_dir_for(THRESHOLD_CRITERION), "mc")
+    DDS_REPS_DIR = os.path.join(DDS_RESULTS_DIR, "reps")
     seeds = SEEDS[: args.repeats]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -487,4 +503,5 @@ if __name__ == "__main__":
         print("==========================================================================")
         print(df_memoria.to_string(index=False))
         print(f"\n[OK] Ficheros guardados en '{DDS_RESULTS_DIR}/'.")
-        print("Para comparar con el MLP y con la inferencia determinista: python compare_models.py --mc")
+        extra = "" if THRESHOLD_CRITERION == "gmean" else f" --umbral {THRESHOLD_CRITERION}"
+        print(f"Para comparar con el MLP y con la inferencia determinista: python compare_models.py --mc{extra}")

@@ -9,13 +9,22 @@ Protocolo (el mismo que debe usar el script del MLP+DDS):
   - El resultado final se expresa como media ± desviación típica (ddof=1) entre las
     repeticiones.
 
-Las repeticiones ya terminadas se guardan en results/reps/ y no se recalculan si el
-script se vuelve a lanzar.
+Las repeticiones ya terminadas se guardan en <carpeta de resultados>/reps/ y no se
+recalculan si el script se vuelve a lanzar. Además de las probabilidades de test, se
+guardan las predicciones de validación interna del candidato elegido en cada fold, para
+poder recalcular el umbral con otro criterio sin volver a entrenar.
+
+Umbral de decisión (--umbral): se elige en el bucle interno maximizando G-Mean (por
+defecto, resultados en results/) o F1 (resultados en results/umbral_f1/). El criterio
+del umbral no cambia los modelos entrenados ni los hiperparámetros elegidos (eso lo
+decide INNER_METRIC), así que las métricas que no dependen del umbral (AUC-ROC, AUC-PR,
+NDCG@10, Precision@10) salen idénticas con los dos criterios.
 
 Uso (desde la raíz del proyecto, donde están Code/ y Data/):
     python train_mlp.py                      # 10 repeticiones, GO y PathDip
     python train_mlp.py --repeats 5          # solo las 5 primeras semillas
     python train_mlp.py --datasets PathDip
+    python train_mlp.py --umbral f1          # umbral elegido por F1
 """
 import argparse
 import os
@@ -48,6 +57,7 @@ N_OUTER_SPLITS = 10      # particiones del bucle externo
 N_INNER_SPLITS = 3       # particiones del bucle interno
 INNER_METRIC = "auc_pr"  # métrica del bucle interno (elige hiperparámetros, no depende del umbral)
 THRESHOLD_CRITERION = "gmean"  # el umbral de decisión se elige en el bucle interno maximizando esta métrica
+                               # ("gmean" o "f1"; se cambia con --umbral)
 
 # El ORDEN de las claves importa: el MLP+DDS debe sortear estas mismas claves
 # en este mismo orden con la misma semilla para compartir hiperparámetros.
@@ -75,6 +85,11 @@ REPORT_METRICS = {
 MODEL_TAG = "MLP"
 RESULTS_DIR = "results"
 REPS_DIR = os.path.join(RESULTS_DIR, "reps")
+
+
+def results_dir_for(criterion: str) -> str:
+    """Carpeta de resultados según el criterio del umbral (G-Mean conserva la de la versión 1)."""
+    return "results" if criterion == "gmean" else os.path.join("results", f"umbral_{criterion}")
 
 
 def set_seed(seed: int):
@@ -172,6 +187,8 @@ def nested_cv_mlp_random_search(x, y, seed, device="cpu"):
     outer_cv = StratifiedKFold(n_splits=N_OUTER_SPLITS, shuffle=True, random_state=seed % (2**32))
     folds_records, fold_metrics = [], []
     oof_probs = np.full(len(y), np.nan)
+    oof_fold = np.zeros(len(y), dtype=int)
+    inner_rows = []  # predicciones de validación interna del candidato elegido (para recalcular umbrales)
 
     for outer_fold, (train_idx, test_idx) in enumerate(outer_cv.split(x, y), 1):
         x_outer_train, x_outer_test = x[train_idx], x[test_idx]
@@ -214,6 +231,9 @@ def nested_cv_mlp_random_search(x, y, seed, device="cpu"):
         final_model = train_single_mlp_model(x_outer_train, y_outer_train, best_candidate, seed=final_seed, device=device)
         test_probs = evaluate_mlp_model(final_model, x_outer_test, device=device)
         oof_probs[test_idx] = test_probs
+        oof_fold[test_idx] = outer_fold
+        inner_rows.append(pd.DataFrame({"Fold": outer_fold, "idx": train_idx,
+                                        "y": y_outer_train, "prob": best_inner_oof}))
 
         test_pred = predict_top_fraction(test_probs, positive_fraction)
         test_m = calculate_all_metrics(y_outer_test, test_probs, y_pred=test_pred)
@@ -239,7 +259,7 @@ def nested_cv_mlp_random_search(x, y, seed, device="cpu"):
         print(f" ep={best_candidate['epochs']} | positivos={100 * positive_fraction:.0f}% | AUC-PR={test_m['auc_pr']:.3f} | "
               f"Sens={test_m['sensitivity']:.3f} | Espec={test_m['specificity']:.3f}")
 
-    return folds_records, fold_metrics, oof_probs
+    return folds_records, fold_metrics, oof_probs, oof_fold, pd.concat(inner_rows, ignore_index=True)
 
 
 def run_or_load_repetition(x, y, dataset, seed, device):
@@ -253,11 +273,12 @@ def run_or_load_repetition(x, y, dataset, seed, device):
         oof = pd.read_csv(oof_path)["prob"].values
         return df_folds, oof
 
-    folds_records, _, oof = nested_cv_mlp_random_search(x, y, seed, device=device)
+    folds_records, _, oof, oof_fold, df_inner = nested_cv_mlp_random_search(x, y, seed, device=device)
     df_folds = pd.DataFrame(folds_records)
     os.makedirs(REPS_DIR, exist_ok=True)
     df_folds.to_csv(folds_path, index=False)
-    pd.DataFrame({"prob": oof}).to_csv(oof_path, index=False)
+    pd.DataFrame({"prob": oof, "fold": oof_fold}).to_csv(oof_path, index=False)
+    df_inner.to_csv(os.path.join(REPS_DIR, f"{MODEL_TAG}_{dataset}_seed{seed}_inner.csv"), index=False)
     return df_folds, oof
 
 
@@ -269,8 +290,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", nargs="+", default=["GO", "PathDip"])
     parser.add_argument("--repeats", type=int, default=len(SEEDS), help="nº de repeticiones (semillas) a usar")
+    parser.add_argument("--umbral", choices=["gmean", "f1"], default=THRESHOLD_CRITERION,
+                        help="métrica que maximiza el umbral de decisión en el bucle interno")
     args = parser.parse_args()
 
+    THRESHOLD_CRITERION = args.umbral
+    RESULTS_DIR = results_dir_for(THRESHOLD_CRITERION)
+    REPS_DIR = os.path.join(RESULTS_DIR, "reps")
     seeds = SEEDS[: args.repeats]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
