@@ -76,7 +76,8 @@ def generate_summary_table_image(results_list, output_path):
     table = ax.table(cellText=table_data, colLabels=headers, loc="center", cellLoc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(11)
-    table.scale(1.2, 1.8)
+    table.auto_set_column_width(col=list(range(len(headers))))  # ancho según el texto de cada columna
+    table.scale(1.0, 1.8)
 
     for i in range(len(headers)):
         cell = table[0, i]

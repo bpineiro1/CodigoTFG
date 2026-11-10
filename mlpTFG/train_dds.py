@@ -9,12 +9,24 @@ el MLP baseline (train_mlp.py):
     como porcentaje de positivos).
 La configuración común se importa de train_mlp.py para que no pueda divergir.
 
+Inferencia Monte Carlo:
+  En entrenamiento el DDS muestrea las compuertas con ruido (selecciones aleatorias), pero
+  en la versión 1 la evaluación era determinista (sin ruido, Top-K fijo). Ahora cada modelo
+  entrenado se evalúa de dos formas:
+    - det: inferencia determinista, igual que en la versión 1.
+    - mc:  dropout apagado, muestreo del DDS activo y media de N_MC probabilidades por gen.
+  El entrenamiento no cambia, así que las dos inferencias se comparan sobre exactamente los
+  mismos modelos entrenados. Cada una elige su propio candidato y su propio umbral en el
+  bucle interno, con su misma forma de inferencia. La parte "det" debe reproducir los
+  resultados de la versión 1, lo que sirve de comprobación.
+
 Además del rendimiento, guarda cuántas características usa cada gen y con qué
 frecuencia se selecciona cada característica en genes CR y NotCR.
 
 Uso (desde la raíz del proyecto, junto a train_mlp.py):
     python train_dds.py                      # 10 repeticiones, GO y PathDip
-    python train_dds.py --repeats 2 --datasets GO
+    python train_dds.py --repeats 1 --datasets PathDip
+Resultados en results/mc/ (los de la versión 1 en results/ no se tocan).
 """
 import argparse
 import os
@@ -34,7 +46,7 @@ from Code.plots import generate_evaluation_plots, generate_summary_table_image
 # Configuración común con el baseline
 from train_mlp import (
     SEEDS, N_ITER_SEARCH, N_OUTER_SPLITS, N_INNER_SPLITS, INNER_METRIC, THRESHOLD_CRITERION,
-    PARAM_SPACE, REPORT_METRICS, RESULTS_DIR, REPS_DIR, set_seed, fmt,
+    PARAM_SPACE, REPORT_METRICS, RESULTS_DIR, set_seed, fmt,
 )
 
 if hasattr(os, "cpu_count") and os.cpu_count() is not None:
@@ -56,7 +68,15 @@ K_GRID = {
 }
 PENALTY_GRID = [0.0, 1e-3, 1e-2, 1e-1]
 
-MODEL_TAG = "MLP_DDS"
+# Inferencia
+N_MC = 30                  # nº de pasadas Monte Carlo que se promedian por gen
+MC_SEED_OFFSET = 500_000   # semilla del muestreo en evaluación = semilla del modelo + offset
+MODES = ("det", "mc")
+MODE_TAG = {"det": "MLP_DDS_DET", "mc": "MLP_DDS_MC"}
+MODE_NAME = {"det": "MLP + DDS (determinista)", "mc": f"MLP + DDS (Monte Carlo, N={N_MC})"}
+
+DDS_RESULTS_DIR = os.path.join(RESULTS_DIR, "mc")
+DDS_REPS_DIR = os.path.join(DDS_RESULTS_DIR, "reps")
 
 
 def load_data(dataset_name: str):
@@ -145,125 +165,261 @@ def train_single_dds_model(x_tr, y_tr, params, seed, device="cpu"):
     return model
 
 
-def evaluate_dds_model(model, x_eval, device="cpu"):
-    """Devuelve probabilidades, máscaras de selección (solo variables activas) y nº de variables usadas."""
+def evaluate_dds_model(model, x_eval, device="cpu", n_mc=0, mc_seed=0):
+    """
+    Devuelve probabilidades, máscaras de selección (solo variables activas) y nº de variables usadas.
+      n_mc = 0: inferencia determinista (sin ruido en las compuertas), como en la versión 1.
+      n_mc > 0: inferencia Monte Carlo: dropout apagado (model.eval()) pero con el muestreo
+                del DDS activo; se promedian las probabilidades de n_mc pasadas. Las máscaras
+                y el nº de variables usadas también se promedian (fracción de pasadas en que
+                se seleccionó cada variable).
+    """
     model.eval()
+    x_t = torch.tensor(x_eval, dtype=torch.float32, device=device)
     with torch.no_grad():
-        logits, _, hard_mask, n_used = model(torch.tensor(x_eval, dtype=torch.float32, device=device))
-        probs = torch.sigmoid(logits).cpu().numpy().flatten()
-        masks = hard_mask.cpu().numpy()
-        n_used = n_used.cpu().numpy()
-    return probs, masks, n_used
+        if n_mc <= 0:
+            logits, _, hard_mask, n_used = model(x_t)
+            return (torch.sigmoid(logits).cpu().numpy().flatten(),
+                    hard_mask.cpu().numpy(), n_used.cpu().numpy())
+
+        torch.manual_seed(mc_seed)  # muestreo reproducible
+        model.dds.mc_sampling = True
+        try:
+            probs_sum, masks_sum, used_sum = 0.0, 0.0, 0.0
+            for _ in range(n_mc):
+                logits, _, hard_mask, n_used = model(x_t)
+                probs_sum = probs_sum + torch.sigmoid(logits)
+                masks_sum = masks_sum + hard_mask
+                used_sum = used_sum + n_used
+        finally:
+            model.dds.mc_sampling = False
+
+    return ((probs_sum / n_mc).cpu().numpy().flatten(),
+            (masks_sum / n_mc).cpu().numpy(), (used_sum / n_mc).cpu().numpy())
+
+
+def n_mc_for(mode):
+    return N_MC if mode == "mc" else 0
 
 
 def nested_cv_dds(x, y, dataset, seed, device="cpu"):
-    """Una repetición de la validación cruzada anidada con la semilla seed."""
+    """
+    Una repetición de la validación cruzada anidada con la semilla seed.
+    Devuelve, para cada forma de inferencia (det / mc): registros por fold, probabilidades
+    out-of-fold y conteos de selección por característica.
+    """
     outer_cv = StratifiedKFold(n_splits=N_OUTER_SPLITS, shuffle=True, random_state=seed % (2**32))
-    folds_records = []
-    oof_probs = np.full(len(y), np.nan)
-
-    # Frecuencia de selección por característica y clase (sobre los genes de test)
     n_feat = x.shape[1]
-    sel_counts = {1: np.zeros(n_feat), 0: np.zeros(n_feat)}
+    out = {
+        m: {"records": [], "oof": np.full(len(y), np.nan), "sel": {1: np.zeros(n_feat), 0: np.zeros(n_feat)}}
+        for m in MODES
+    }
     act_counts = {1: np.zeros(n_feat), 0: np.zeros(n_feat)}
 
     for outer_fold, (train_idx, test_idx) in enumerate(outer_cv.split(x, y), 1):
         x_outer_train, x_outer_test = x[train_idx], x[test_idx]
         y_outer_train, y_outer_test = y[train_idx], y[test_idx]
 
-        # Bucle interno: Random Search
+        # Bucle interno: Random Search (cada modelo se evalúa con las dos inferencias)
         inner_cv = StratifiedKFold(n_splits=N_INNER_SPLITS, shuffle=True, random_state=(seed + outer_fold) % (2**32))
         candidates = sample_candidates(seed, outer_fold, dataset)
-
-        best_inner_score, best_candidate, best_inner_oof = -1.0, None, None
+        best = {m: {"score": -1.0, "idx": None, "oof": None} for m in MODES}
         print(f"    Fold {outer_fold:02d}/{N_OUTER_SPLITS} ", end="", flush=True)
 
         for cand_idx, cand in enumerate(candidates):
-            inner_scores = []
-            inner_oof = np.zeros(len(y_outer_train))
+            inner_scores = {m: [] for m in MODES}
+            inner_oof = {m: np.zeros(len(y_outer_train)) for m in MODES}
             for in_fold, (in_tr_idx, in_val_idx) in enumerate(inner_cv.split(x_outer_train, y_outer_train)):
                 train_seed = seed + outer_fold * 1000 + cand_idx * 10 + in_fold
                 inner_model = train_single_dds_model(
                     x_outer_train[in_tr_idx], y_outer_train[in_tr_idx], cand, seed=train_seed, device=device
                 )
-                val_probs, _, _ = evaluate_dds_model(inner_model, x_outer_train[in_val_idx], device=device)
-                inner_oof[in_val_idx] = val_probs
-                inner_scores.append(calculate_all_metrics(y_outer_train[in_val_idx], val_probs)[INNER_METRIC])
+                for m in MODES:
+                    val_probs, _, _ = evaluate_dds_model(
+                        inner_model, x_outer_train[in_val_idx], device=device,
+                        n_mc=n_mc_for(m), mc_seed=train_seed + MC_SEED_OFFSET,
+                    )
+                    inner_oof[m][in_val_idx] = val_probs
+                    inner_scores[m].append(calculate_all_metrics(y_outer_train[in_val_idx], val_probs)[INNER_METRIC])
             print(".", end="", flush=True)
 
-            mean_score = float(np.mean(inner_scores))
-            if mean_score > best_inner_score:
-                best_inner_score, best_candidate, best_inner_oof = mean_score, cand, inner_oof
+            for m in MODES:
+                mean_score = float(np.mean(inner_scores[m]))
+                if mean_score > best[m]["score"]:
+                    best[m] = {"score": mean_score, "idx": cand_idx, "oof": inner_oof[m]}
 
-        # Umbral: igual que en el baseline (G-Mean en el bucle interno, trasladado como porcentaje)
-        threshold = best_threshold(y_outer_train, best_inner_oof, criterion=THRESHOLD_CRITERION)
-        positive_fraction = float(np.mean(best_inner_oof >= threshold))
-
-        # Reentrenamiento final y test
+        # Reentrenamiento final y test. Si las dos inferencias eligen el mismo candidato,
+        # el modelo final es el mismo (misma semilla) y se entrena una sola vez.
         final_seed = seed + outer_fold * 1000 + 999
-        final_model = train_single_dds_model(x_outer_train, y_outer_train, best_candidate, seed=final_seed, device=device)
-        test_probs, test_masks, test_n_used = evaluate_dds_model(final_model, x_outer_test, device=device)
-        oof_probs[test_idx] = test_probs
-
-        test_pred = predict_top_fraction(test_probs, positive_fraction)
-        test_m = calculate_all_metrics(y_outer_test, test_probs, y_pred=test_pred)
-
+        final_models = {}
         n_active = (x_outer_test > 0).sum(axis=1)
         for cls in (0, 1):
-            idx = y_outer_test == cls
-            sel_counts[cls] += test_masks[idx].sum(axis=0)
-            act_counts[cls] += (x_outer_test[idx] > 0).sum(axis=0)
+            act_counts[cls] += (x_outer_test[y_outer_test == cls] > 0).sum(axis=0)
 
-        record = {
-            "Semilla": seed,
-            "Fold": outer_fold,
-            "K": best_candidate["k_features"],
-            "Penalty": best_candidate["penalty_weight"],
-            "Epochs": best_candidate["epochs"],
-            "Batch": best_candidate["batch_size"],
-            "LR": best_candidate["lr"],
-            "Weight": best_candidate["weight_mode"],
-            "WeightDecay": best_candidate["weight_decay"],
-            "Dropout": best_candidate["dropout"],
-            f"Inner_{INNER_METRIC}": best_inner_score,
-            "Umbral_interno": threshold,
-            "Pct_positivos": positive_fraction,
-            "Feats_activas_media": float(n_active.mean()),
-            "Feats_usadas_media": float(test_n_used.mean()),
-            "Pct_activas_usadas": float(100 * test_n_used.sum() / max(n_active.sum(), 1)),
-        }
-        record.update({name: test_m[key] for key, name in REPORT_METRICS.items()})
-        record["Precision"] = test_m["precision"]
-        folds_records.append(record)
+        fold_txt = []
+        for m in MODES:
+            cand_idx = best[m]["idx"]
+            cand = candidates[cand_idx]
 
-        print(f" K={best_candidate['k_features']} | usa {test_n_used.mean():.0f} de {n_active.mean():.0f} activas | "
-              f"AUC-PR={test_m['auc_pr']:.3f} | Sens={test_m['sensitivity']:.3f} | Espec={test_m['specificity']:.3f}")
+            # Umbral: igual que en el baseline (G-Mean en el bucle interno, trasladado como porcentaje)
+            threshold = best_threshold(y_outer_train, best[m]["oof"], criterion=THRESHOLD_CRITERION)
+            positive_fraction = float(np.mean(best[m]["oof"] >= threshold))
 
-    df_freq = pd.DataFrame({
-        "Sel_CR": sel_counts[1], "Act_CR": act_counts[1],
-        "Sel_NotCR": sel_counts[0], "Act_NotCR": act_counts[0],
-    })
-    return folds_records, oof_probs, df_freq
+            if cand_idx not in final_models:
+                final_models[cand_idx] = train_single_dds_model(
+                    x_outer_train, y_outer_train, cand, seed=final_seed, device=device)
+            test_probs, test_masks, test_n_used = evaluate_dds_model(
+                final_models[cand_idx], x_outer_test, device=device,
+                n_mc=n_mc_for(m), mc_seed=final_seed + MC_SEED_OFFSET,
+            )
+            out[m]["oof"][test_idx] = test_probs
+
+            test_pred = predict_top_fraction(test_probs, positive_fraction)
+            test_m = calculate_all_metrics(y_outer_test, test_probs, y_pred=test_pred)
+
+            for cls in (0, 1):
+                out[m]["sel"][cls] += test_masks[y_outer_test == cls].sum(axis=0)
+
+            record = {
+                "Semilla": seed,
+                "Fold": outer_fold,
+                "Inferencia": m,
+                "N_MC": n_mc_for(m),
+                "K": cand["k_features"],
+                "Penalty": cand["penalty_weight"],
+                "Epochs": cand["epochs"],
+                "Batch": cand["batch_size"],
+                "LR": cand["lr"],
+                "Weight": cand["weight_mode"],
+                "WeightDecay": cand["weight_decay"],
+                "Dropout": cand["dropout"],
+                f"Inner_{INNER_METRIC}": best[m]["score"],
+                "Umbral_interno": threshold,
+                "Pct_positivos": positive_fraction,
+                "Feats_activas_media": float(n_active.mean()),
+                "Feats_usadas_media": float(test_n_used.mean()),
+                "Pct_activas_usadas": float(100 * test_n_used.sum() / max(n_active.sum(), 1)),
+            }
+            record.update({name: test_m[key] for key, name in REPORT_METRICS.items()})
+            record["Precision"] = test_m["precision"]
+            out[m]["records"].append(record)
+            fold_txt.append(f"{m.upper()}: K={cand['k_features']} AUC-PR={test_m['auc_pr']:.3f} "
+                            f"Sens={test_m['sensitivity']:.2f} Espec={test_m['specificity']:.2f}")
+
+        print(f" usa ~{out['mc']['records'][-1]['Feats_usadas_media']:.0f} de {n_active.mean():.0f} activas | "
+              + " | ".join(fold_txt))
+
+    results = {}
+    for m in MODES:
+        df_freq = pd.DataFrame({
+            "Sel_CR": out[m]["sel"][1], "Act_CR": act_counts[1],
+            "Sel_NotCR": out[m]["sel"][0], "Act_NotCR": act_counts[0],
+        })
+        results[m] = (out[m]["records"], out[m]["oof"], df_freq)
+    return results
+
+
+def rep_paths(dataset, seed, mode):
+    tag = MODE_TAG[mode]
+    return {k: os.path.join(DDS_REPS_DIR, f"{tag}_{dataset}_seed{seed}_{k}.csv") for k in ("folds", "oof", "freq")}
 
 
 def run_or_load_repetition(x, y, dataset, seed, device):
-    """Ejecuta una repetición o la carga de disco si ya se había terminado antes."""
-    paths = {
-        "folds": os.path.join(REPS_DIR, f"{MODEL_TAG}_{dataset}_seed{seed}_folds.csv"),
-        "oof": os.path.join(REPS_DIR, f"{MODEL_TAG}_{dataset}_seed{seed}_oof.csv"),
-        "freq": os.path.join(REPS_DIR, f"{MODEL_TAG}_{dataset}_seed{seed}_freq.csv"),
-    }
-    if all(os.path.exists(p) for p in paths.values()):
-        print(f"  [Semilla {seed}] ya calculada, se carga de '{REPS_DIR}/'")
-        return pd.read_csv(paths["folds"]), pd.read_csv(paths["oof"])["prob"].values, pd.read_csv(paths["freq"])
+    """Ejecuta una repetición (las dos inferencias) o la carga de disco si ya se había terminado antes."""
+    paths = {m: rep_paths(dataset, seed, m) for m in MODES}
+    if all(os.path.exists(p) for m in MODES for p in paths[m].values()):
+        print(f"  [Semilla {seed}] ya calculada, se carga de '{DDS_REPS_DIR}/'")
+        return {m: (pd.read_csv(paths[m]["folds"]), pd.read_csv(paths[m]["oof"])["prob"].values,
+                    pd.read_csv(paths[m]["freq"])) for m in MODES}
 
-    folds_records, oof, df_freq = nested_cv_dds(x, y, dataset, seed, device=device)
-    df_folds = pd.DataFrame(folds_records)
-    os.makedirs(REPS_DIR, exist_ok=True)
-    df_folds.to_csv(paths["folds"], index=False)
-    pd.DataFrame({"prob": oof}).to_csv(paths["oof"], index=False)
-    df_freq.to_csv(paths["freq"], index=False)
-    return df_folds, oof, df_freq
+    results = nested_cv_dds(x, y, dataset, seed, device=device)
+    os.makedirs(DDS_REPS_DIR, exist_ok=True)
+    loaded = {}
+    for m, (records, oof, df_freq) in results.items():
+        df_folds = pd.DataFrame(records)
+        df_folds.to_csv(paths[m]["folds"], index=False)
+        pd.DataFrame({"prob": oof}).to_csv(paths[m]["oof"], index=False)
+        df_freq.to_csv(paths[m]["freq"], index=False)
+        loaded[m] = (df_folds, oof, df_freq)
+    return loaded
+
+
+def save_merged(rows, path, keys):
+    """Guarda la tabla conservando las filas de otros datasets que ya hubiera en el fichero."""
+    df_new = pd.DataFrame(rows)
+    if os.path.exists(path):
+        df_old = pd.read_csv(path)
+        if all(k in df_old.columns for k in keys):
+            new_keys = set(map(tuple, df_new[keys].values))
+            df_old = df_old[[tuple(r) not in new_keys for r in df_old[keys].values]]
+            df_new = pd.concat([df_old, df_new], ignore_index=True)
+    df_new.to_csv(path, index=False)
+    return df_new
+
+
+def aggregate_mode(mode, dataset, seeds, folds_list, oof_list, freq_total, y, gene_names, feature_names):
+    """Escribe los ficheros de un dataset para una forma de inferencia y devuelve sus filas de resumen."""
+    tag = MODE_TAG[mode]
+
+    df_all_folds = pd.concat(folds_list, ignore_index=True)
+    df_all_folds.to_csv(os.path.join(DDS_RESULTS_DIR, f"metricas_detalladas_folds_{tag}_{dataset}.csv"), index=False)
+
+    rep_rows = []
+    for r, (seed, df) in enumerate(zip(seeds, folds_list), 1):
+        row = {"Repeticion": r, "Semilla": seed}
+        row.update({name: df[name].mean() for name in REPORT_METRICS.values()})
+        row["Feats_usadas_media"] = df["Feats_usadas_media"].mean()
+        row["Pct_activas_usadas"] = df["Pct_activas_usadas"].mean()
+        rep_rows.append(row)
+    df_reps = pd.DataFrame(rep_rows)
+    df_reps.to_csv(os.path.join(DDS_RESULTS_DIR, f"metricas_por_repeticion_{tag}_{dataset}.csv"), index=False)
+
+    oof_matrix = np.vstack(oof_list)
+    df_rank = pd.DataFrame({"Gen": gene_names, "Clase_CR": y, "Prob_media": oof_matrix.mean(axis=0)})
+    for r, seed in enumerate(seeds, 1):
+        df_rank[f"Prob_seed{seed}"] = oof_matrix[r - 1]
+    df_rank.sort_values("Prob_media", ascending=False).to_csv(
+        os.path.join(DDS_RESULTS_DIR, f"ranking_genes_{tag}_{dataset}.csv"), index=False)
+
+    # Frecuencia de selección de cada característica (sobre todas las repeticiones):
+    #   Sel_%: en qué % de los genes de la clase se seleccionó (en MC, media de las pasadas)
+    #   Sel_si_activa_%: de los genes de la clase que la tienen activa, en qué % se seleccionó
+    df_feat = pd.DataFrame({"Caracteristica": feature_names})
+    n_cls = {"CR": len(seeds) * int(np.sum(y == 1)), "NotCR": len(seeds) * int(np.sum(y == 0))}
+    for cls in ("CR", "NotCR"):
+        df_feat[f"Sel_{cls}_%"] = 100 * freq_total[f"Sel_{cls}"].values / n_cls[cls]
+        df_feat[f"Activa_{cls}_%"] = 100 * freq_total[f"Act_{cls}"].values / n_cls[cls]
+        df_feat[f"Sel_si_activa_{cls}_%"] = 100 * freq_total[f"Sel_{cls}"].values / np.maximum(freq_total[f"Act_{cls}"].values, 1)
+    df_feat["Diferencia_CR_menos_NotCR"] = df_feat["Sel_CR_%"] - df_feat["Sel_NotCR_%"]
+    df_feat = df_feat.sort_values("Diferencia_CR_menos_NotCR", ascending=False)
+    df_feat.round(2).to_csv(os.path.join(DDS_RESULTS_DIR, f"frecuencia_seleccion_{tag}_{dataset}.csv"), index=False)
+
+    runs_metrics = [
+        [{key: row[name] for key, name in REPORT_METRICS.items()} for _, row in df.iterrows()]
+        for df in folds_list
+    ]
+    generate_evaluation_plots(runs_metrics, output_dir=os.path.join(DDS_RESULTS_DIR, f"plots_{dataset}_{mode}"),
+                              dataset_name=dataset, model_name=tag)
+
+    # Media ± desviación típica entre repeticiones
+    cols = list(REPORT_METRICS.values())
+    means = df_reps[cols].mean()
+    stds = df_reps[cols].std(ddof=1) if len(df_reps) > 1 else means * 0
+    feats_txt = (f"{df_reps['Feats_usadas_media'].mean():.0f} por gen "
+                 f"({df_reps['Pct_activas_usadas'].mean():.0f}% de las activas)")
+
+    summary_row = {
+        "Fase": "Determinista" if mode == "det" else f"Monte Carlo (N={N_MC})",
+        "Modelo": f"MLP + DDS ({dataset})",
+        "Nº Feats": feats_txt,
+        "G-Mean": fmt(means["G-Mean"], stds["G-Mean"]),
+        "F1-Score": fmt(means["F1-Score"], stds["F1-Score"]),
+        "AUC-ROC": fmt(means["AUC-ROC"], stds["AUC-ROC"]),
+        "AUC-PR": fmt(means["AUC-PR"], stds["AUC-PR"]),
+    }
+    memoria_row = {"Método": MODE_NAME[mode], "Dataset": dataset, "Nº Feats": feats_txt}
+    memoria_row.update({name: fmt(means[name], stds[name]) for name in cols})
+    return summary_row, memoria_row, df_feat
 
 
 if __name__ == "__main__":
@@ -275,11 +431,12 @@ if __name__ == "__main__":
     seeds = SEEDS[: args.repeats]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print("=== MLP + DDS: VALIDACIÓN CRUZADA ANIDADA REPETIDA ===")
+    print("=== MLP + DDS: VALIDACIÓN CRUZADA ANIDADA REPETIDA (inferencia determinista y Monte Carlo) ===")
     print(f"Dispositivo: {device} | Repeticiones: {len(seeds)} | Folds: {N_OUTER_SPLITS}x{N_INNER_SPLITS} | "
-          f"Candidatos por fold: {N_ITER_SEARCH} | Métrica interna: {INNER_METRIC} | Umbral por: {THRESHOLD_CRITERION}")
+          f"Candidatos por fold: {N_ITER_SEARCH} | Métrica interna: {INNER_METRIC} | Umbral por: {THRESHOLD_CRITERION} | "
+          f"Pasadas MC: {N_MC}")
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(DDS_RESULTS_DIR, exist_ok=True)
     summary_rows, memoria_rows = [], []
 
     for dataset in args.datasets:
@@ -291,90 +448,43 @@ if __name__ == "__main__":
             continue
 
         x, y, gene_names, feature_names = load_data(dataset)
-        all_folds, rep_rows, oof_matrix = [], [], []
-        freq_total = None
+        folds = {m: [] for m in MODES}
+        oofs = {m: [] for m in MODES}
+        freqs = {m: None for m in MODES}
 
         for r, seed in enumerate(seeds, 1):
             print(f"\n  ===== {dataset} | Repetición {r}/{len(seeds)} (semilla {seed}) =====")
-            df_folds, oof, df_freq = run_or_load_repetition(x, y, dataset, seed, device)
-            all_folds.append(df_folds.assign(Repeticion=r))
-            oof_matrix.append(oof)
-            freq_total = df_freq if freq_total is None else freq_total + df_freq
+            results = run_or_load_repetition(x, y, dataset, seed, device)
+            txt = []
+            for m in MODES:
+                df_folds, oof, df_freq = results[m]
+                folds[m].append(df_folds.assign(Repeticion=r))
+                oofs[m].append(oof)
+                freqs[m] = df_freq if freqs[m] is None else freqs[m] + df_freq
+                txt.append(f"{m.upper()}: AUC-ROC={df_folds['AUC-ROC'].mean():.3f} AUC-PR={df_folds['AUC-PR'].mean():.3f} "
+                           f"G-Mean={df_folds['G-Mean'].mean():.3f}")
+            print("  -> Repetición " + str(r) + ": " + " | ".join(txt))
 
-            rep_row = {"Repeticion": r, "Semilla": seed}
-            rep_row.update({name: df_folds[name].mean() for name in REPORT_METRICS.values()})
-            rep_row["Feats_usadas_media"] = df_folds["Feats_usadas_media"].mean()
-            rep_row["Pct_activas_usadas"] = df_folds["Pct_activas_usadas"].mean()
-            rep_rows.append(rep_row)
-            print(f"  -> Repetición {r}: AUC-ROC={rep_row['AUC-ROC']:.3f} | AUC-PR={rep_row['AUC-PR']:.3f} | "
-                  f"G-Mean={rep_row['G-Mean']:.3f} | usa el {rep_row['Pct_activas_usadas']:.0f}% de las activas")
+        for m in MODES:
+            summary_row, memoria_row, df_feat = aggregate_mode(
+                m, dataset, seeds, folds[m], oofs[m], freqs[m], y, gene_names, feature_names)
+            summary_rows.append(summary_row)
+            memoria_rows.append(memoria_row)
 
-        # Ficheros por dataset
-        df_all_folds = pd.concat(all_folds, ignore_index=True)
-        df_all_folds.to_csv(os.path.join(RESULTS_DIR, f"metricas_detalladas_folds_{MODEL_TAG}_{dataset}.csv"), index=False)
-
-        df_reps = pd.DataFrame(rep_rows)
-        df_reps.to_csv(os.path.join(RESULTS_DIR, f"metricas_por_repeticion_{MODEL_TAG}_{dataset}.csv"), index=False)
-
-        oof_matrix = np.vstack(oof_matrix)
-        df_rank = pd.DataFrame({"Gen": gene_names, "Clase_CR": y, "Prob_media": oof_matrix.mean(axis=0)})
-        for r, seed in enumerate(seeds, 1):
-            df_rank[f"Prob_seed{seed}"] = oof_matrix[r - 1]
-        df_rank.sort_values("Prob_media", ascending=False).to_csv(
-            os.path.join(RESULTS_DIR, f"ranking_genes_{MODEL_TAG}_{dataset}.csv"), index=False)
-
-        # Frecuencia de selección de cada característica (sobre todas las repeticiones):
-        #   Sel_%: en qué % de los genes de la clase se seleccionó
-        #   Sel_si_activa_%: de los genes de la clase que la tienen activa, en qué % se seleccionó
-        df_feat = pd.DataFrame({"Caracteristica": feature_names})
-        n_cls = {"CR": len(seeds) * int(np.sum(y == 1)), "NotCR": len(seeds) * int(np.sum(y == 0))}
-        for cls in ("CR", "NotCR"):
-            df_feat[f"Sel_{cls}_%"] = 100 * freq_total[f"Sel_{cls}"].values / n_cls[cls]
-            df_feat[f"Activa_{cls}_%"] = 100 * freq_total[f"Act_{cls}"].values / n_cls[cls]
-            df_feat[f"Sel_si_activa_{cls}_%"] = 100 * freq_total[f"Sel_{cls}"].values / np.maximum(freq_total[f"Act_{cls}"].values, 1)
-        df_feat["Diferencia_CR_menos_NotCR"] = df_feat["Sel_CR_%"] - df_feat["Sel_NotCR_%"]
-        df_feat = df_feat.sort_values("Sel_CR_%", ascending=False)
-        df_feat.round(2).to_csv(os.path.join(RESULTS_DIR, f"frecuencia_seleccion_{MODEL_TAG}_{dataset}.csv"), index=False)
-
-        print(f"\n---> Características más seleccionadas en genes CR ({dataset}):")
+        print(f"\n---> Características más seleccionadas en genes CR frente a NotCR ({dataset}, Monte Carlo):")
         print(df_feat.head(10)[["Caracteristica", "Sel_CR_%", "Sel_NotCR_%", "Sel_si_activa_CR_%"]].round(1).to_string(index=False))
 
-        runs_metrics = [
-            [{key: row[name] for key, name in REPORT_METRICS.items()} for _, row in df.iterrows()]
-            for df in all_folds
-        ]
-        generate_evaluation_plots(runs_metrics, output_dir=os.path.join(RESULTS_DIR, f"plots_{dataset}"),
-                                  dataset_name=dataset, model_name="MLP_DDS")
-
-        # Media ± desviación típica entre repeticiones
-        cols = list(REPORT_METRICS.values())
-        means = df_reps[cols].mean()
-        stds = df_reps[cols].std(ddof=1) if len(df_reps) > 1 else means * 0
-        feats_txt = (f"{df_reps['Feats_usadas_media'].mean():.0f} por gen "
-                     f"({df_reps['Pct_activas_usadas'].mean():.0f}% de las activas)")
-
-        summary_rows.append({
-            "Fase": "MLP + DDS",
-            "Modelo": f"MLP + DDS ({dataset})",
-            "Nº Feats": feats_txt,
-            "G-Mean": fmt(means["G-Mean"], stds["G-Mean"]),
-            "F1-Score": fmt(means["F1-Score"], stds["F1-Score"]),
-            "AUC-ROC": fmt(means["AUC-ROC"], stds["AUC-ROC"]),
-            "AUC-PR": fmt(means["AUC-PR"], stds["AUC-PR"]),
-        })
-        memoria_row = {"Método": "MLP + DDS", "Dataset": dataset, "Nº Feats": feats_txt}
-        memoria_row.update({name: fmt(means[name], stds[name]) for name in cols})
-        memoria_rows.append(memoria_row)
-
     if summary_rows:
-        pd.DataFrame(summary_rows).to_csv(os.path.join(RESULTS_DIR, f"tabla_resumen_{MODEL_TAG}_NestedCV.csv"), index=False)
-        generate_summary_table_image(summary_rows, os.path.join(RESULTS_DIR, f"tabla_resumen_{MODEL_TAG}_NestedCV.png"))
-
-        df_memoria = pd.DataFrame(memoria_rows)
-        df_memoria.to_csv(os.path.join(RESULTS_DIR, "tabla_dds_media_std.csv"), index=False)
+        df_summary = save_merged(summary_rows, os.path.join(DDS_RESULTS_DIR, "tabla_resumen_MLP_DDS_NestedCV.csv"),
+                                 keys=["Fase", "Modelo"])
+        generate_summary_table_image(df_summary.to_dict("records"),
+                                     os.path.join(DDS_RESULTS_DIR, "tabla_resumen_MLP_DDS_NestedCV.png"))
+        df_memoria = save_merged(memoria_rows, os.path.join(DDS_RESULTS_DIR, "tabla_dds_media_std.csv"),
+                                 keys=["Método", "Dataset"])
 
         print("\n==========================================================================")
         print(f"RESULTADOS: media ± desviación típica entre {len(seeds)} repeticiones")
         print("==========================================================================")
         print(df_memoria.to_string(index=False))
-        print(f"\n[OK] Ficheros guardados en '{RESULTS_DIR}/'.")
+        print(f"\n[OK] Ficheros guardados en '{DDS_RESULTS_DIR}/'.")
+        print("Para comparar con el MLP y con la inferencia determinista: python compare_models.py --mc")

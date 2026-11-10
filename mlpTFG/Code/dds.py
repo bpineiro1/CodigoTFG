@@ -15,6 +15,10 @@ Procedencia:
       * Estimador Straight-Through para que el gradiente llegue a todas las compuertas.
       * Penalización sobre la suma de compuertas de las características activas que
         excede K (la del original estaba desactivada, multiplicada por 0).
+      * Inferencia Monte Carlo (`mc_sampling`): si se activa, el muestreo de las compuertas
+        (ruido logístico) se mantiene también en evaluación, para promediar varias
+        selecciones aleatorias como las que el modelo vio en entrenamiento. La exploración
+        `factor_2` sigue siendo solo de entrenamiento.
 """
 import torch
 import torch.nn as nn
@@ -43,6 +47,9 @@ class DynamicDataSelectionHard2(nn.Module):
         # Importancia aprendible de cada característica (se optimiza junto con el MLP)
         self.gate_bias = nn.Parameter(torch.zeros(self.in_features))
 
+        # Inferencia Monte Carlo: mantener el muestreo de las compuertas en evaluación
+        self.mc_sampling = False
+
     @staticmethod
     def _quantile_concrete(eps: torch.Tensor, logits: torch.Tensor, temperature: float) -> torch.Tensor:
         logistic_noise = torch.log(eps) - torch.log1p(-eps)
@@ -60,7 +67,7 @@ class DynamicDataSelectionHard2(nn.Module):
         active = (x > 0).float()
 
         logits = x + self.gate_bias.unsqueeze(0)
-        if self.training:
+        if self.training or self.mc_sampling:
             eps = torch.empty_like(logits).uniform_(EPSILON, 1.0 - EPSILON)
             z = self._quantile_concrete(eps, logits, self.temp)
         else:
